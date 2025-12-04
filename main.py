@@ -1,180 +1,164 @@
-import os
-import time
-import base64
-from typing import Optional
-
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Body
 from pydantic import BaseModel
-
+import base64, time, string
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.backends import default_backend
 import pyotp
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from pathlib import Path
+SEED_FILE = Path("/data/seed.txt")
 
-# For local testing on Windows, keep it relative.
-# In Docker they will mount /data, you can change it there.
-DATA_SEED_PATH = "data/seed.txt"
+app = FastAPI(title="Secure PKI - TOTP 2FA Microservice", version="1.0")
 
-
-# ---------- RSA PRIVATE KEY LOADING ----------
-
-def load_private_key(path: str = "student_private.pem"):
-    with open(path, "rb") as f:
-        return serialization.load_pem_private_key(
-            f.read(),
-            password=None
-        )
-
-
-# ---------- SEED VALIDATION + CONVERSION ----------
-
-def _validate_hex_seed(hex_seed: str):
-    if len(hex_seed) != 64:
-        raise ValueError("Seed must be 64 characters")
-    hex_chars = "0123456789abcdefABCDEF"
-    if not all(c in hex_chars for c in hex_seed):
-        raise ValueError("Seed must be hexadecimal")
-
-
-def _hex_seed_to_base32(hex_seed: str) -> str:
-    _validate_hex_seed(hex_seed)
-    seed_bytes = bytes.fromhex(hex_seed)
-    base32_bytes = base64.b32encode(seed_bytes)
-    return base32_bytes.decode("utf-8")
-
-
-def generate_totp_code(hex_seed: str) -> str:
-    base32_seed = _hex_seed_to_base32(hex_seed)
-    totp = pyotp.TOTP(base32_seed, digits=6, interval=30)
-    return totp.now()
-
-
-def verify_totp_code(hex_seed: str, code: str, valid_window: int = 1) -> bool:
-    base32_seed = _hex_seed_to_base32(hex_seed)
-    totp = pyotp.TOTP(base32_seed, digits=6, interval=30)
-    return bool(totp.verify(code, valid_window=valid_window))
-
-
-def load_hex_seed_from_file() -> str:
-    with open(DATA_SEED_PATH, "r") as f:
-        hex_seed = f.read().strip()
-    _validate_hex_seed(hex_seed)
-    return hex_seed
-
-
-# ---------- FastAPI app ----------
-
-app = FastAPI()
+HEX_CHARS = set("0123456789abcdef")
 
 
 class DecryptSeedRequest(BaseModel):
     encrypted_seed: str
 
 
-class Verify2FARequest(BaseModel):
-    code: str
+class VerifyRequest(BaseModel):
+    code: str | None = None
 
 
-# Endpoint 1: POST /decrypt-seed
-@app.post("/decrypt-seed")
-async def decrypt_seed_endpoint(body: DecryptSeedRequest):
+# Load your RSA private key
+def load_private_key():
     try:
-        # 1. Load private key
-        private_key = load_private_key("student_private.pem")
+        with open("student_private.pem", "rb") as f:
+            key = serialization.load_pem_private_key(
+                f.read(), password=None, backend=default_backend()
+            )
+        return key
+    except Exception as e:
+        print(f"Failed to load private key: {e}", file=sys.stderr)
+        raise HTTPException(status_code=500, detail="Private key unavailable")
 
-        # 2. Base64 decode
-        encrypted_bytes = base64.b64decode(body.encrypted_seed)
 
-        # 3. RSA OAEP SHA-256 decrypt
-        decrypted_bytes = private_key.decrypt(
-            encrypted_bytes,
+# Decrypt seed with RSA/OAEP-SHA256
+def decrypt_seed(encrypted_b64: str, private_key) -> str:
+    try:
+        cipher = base64.b64decode(encrypted_b64)
+        plain = private_key.decrypt(
+            cipher,
             padding.OAEP(
-                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                mgf=padding.MGF1(hashes.SHA256()),
                 algorithm=hashes.SHA256(),
                 label=None
-            )
+            ),
         )
+        seed = plain.decode("utf-8").strip().lower()
 
-        # 4. Bytes -> string (hex seed) + validate
-        hex_seed = decrypted_bytes.decode("utf-8").strip()
-        _validate_hex_seed(hex_seed)
+        # Validate 64-char lowercase hex
+        if len(seed) != 64 or any(c not in HEX_CHARS for c in seed):
+            raise ValueError("Invalid seed format")
 
-        # 5. Save to data/seed.txt
-        os.makedirs(os.path.dirname(DATA_SEED_PATH), exist_ok=True)
-        with open(DATA_SEED_PATH, "w") as f:
-            f.write(hex_seed)
+        return seed
 
-        # 6. Success response
-        return {"status": "ok"}
+    except Exception as e:
+        print(f"Decryption error: {e}", file=sys.stderr)
+        raise HTTPException(status_code=500, detail="Decryption failed")
 
+
+# Generate TOTP code
+def generate_totp_code(hex_seed: str) -> str:
+    try:
+        seed_bytes = bytes.fromhex(hex_seed)
+        base32_seed = base64.b32encode(seed_bytes).decode("utf-8")
+
+        totp = pyotp.TOTP(base32_seed, digits=6, interval=30)
+        return totp.now()
     except Exception:
-        # any error => 500 with required message
-        return JSONResponse(
-            status_code=500,
-            content={"error": "Decryption failed"}
-        )
+        raise HTTPException(status_code=500, detail="TOTP generation failed")
 
 
-# Endpoint 2: GET /generate-2fa
+# Verify TOTP ±1 period
+def verify_totp_code(hex_seed: str, code: str) -> bool:
+    try:
+        seed_bytes = bytes.fromhex(hex_seed)
+        base32_seed = base64.b32encode(seed_bytes).decode("utf-8")
+        totp = pyotp.TOTP(base32_seed, digits=6, interval=30)
+        return totp.verify(code, valid_window=1)
+    except Exception:
+        return False
+
+
+# Remaining seconds left
+def seconds_left(interval: int = 30) -> int:
+    now = int(time.time())
+    return interval - (now % interval)
+
+
+# --- API ENDPOINTS ---
+
+@app.post("/decrypt-seed")
+def decrypt_seed_endpoint(payload: DecryptSeedRequest):
+    private_key = load_private_key()
+    try:
+        hex_seed = decrypt_seed(payload.encrypted_seed, private_key)
+    except Exception:
+        raise HTTPException(status_code=500, detail="Decryption failed")
+
+    SEED_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SEED_FILE.write_text(hex_seed + "\n", encoding="utf-8")
+
+    return {"status": "ok"}
+
+
 @app.get("/generate-2fa")
-async def generate_2fa():
-    # 1. Check seed file
-    if not os.path.exists(DATA_SEED_PATH):
-        return JSONResponse(
-            status_code=500,
-            content={"error": "Seed not decrypted yet"}
-        )
+def generate_2fa_endpoint():
+    if not SEED_FILE.exists():
+        raise HTTPException(status_code=500, detail="Seed not decrypted yet")
 
     try:
-        # 2. Read hex seed
-        hex_seed = load_hex_seed_from_file()
+        hex_seed = SEED_FILE.read_text(encoding="utf-8").strip().lower()
+    except Exception as e:
+        print(f"Seed file read error: {e}", file=sys.stderr)
+        raise HTTPException(status_code=500, detail="Seed unreadable")
 
-        # 3. Generate code
-        code = generate_totp_code(hex_seed)
+    code = generate_totp_code(hex_seed)  # throws 500 if it fails
 
-        # 4. Calculate remaining seconds in this 30s window
-        interval = 30
-        now = int(time.time())
-        valid_for = interval - (now % interval)   # 1–30
+    valid_for = seconds_left(30)
 
-        return {"code": code, "valid_for": valid_for}
+    # Optional extra cron log fallback (keeps the service robust)
+    cron_log_dir = Path("/cron")
+    cron_log_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with open("/cron/last_code.txt", "a", encoding="utf-8", newline="\n") as f:
+            utc_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            f.write(f"{utc_timestamp} - 2FA Code: {code}\n")
+    except Exception as e:
+        print(f"Failed to write cron log fallback: {e}", file=sys.stderr)
 
-    except Exception:
-        return JSONResponse(
-            status_code=500,
-            content={"error": "Seed not decrypted yet"}
-        )
+    return {"code": code, "valid_for": valid_for}
 
 
-# Endpoint 3: POST /verify-2fa
 @app.post("/verify-2fa")
-async def verify_2fa(body: Optional[Verify2FARequest] = None):
-    # 1. Validate code field
-    if body is None or not body.code:
-        return JSONResponse(
-            status_code=400,
-            content={"error": "Missing code"}
-        )
+def verify_2fa_endpoint(payload: VerifyRequest):
+    if payload.code is None:
+        raise HTTPException(status_code=400, detail="Missing code")
 
-    # 2. Check seed file
-    if not os.path.exists(DATA_SEED_PATH):
-        return JSONResponse(
-            status_code=500,
-            content={"error": "Seed not decrypted yet"}
-        )
+    if not SEED_FILE.exists():
+        raise HTTPException(status_code=500, detail="Seed not decrypted yet")
 
     try:
-        # 3. Read seed
-        hex_seed = load_hex_seed_from_file()
+        hex_seed = SEED_FILE.read_text(encoding="utf-8").strip().lower()
+    except Exception as e:
+        print(f"Seed file read error: {e}", file=sys.stderr)
+        raise HTTPException(status_code=500, detail="Seed unreadable")
 
-        # 4. Verify with ±1 period
-        is_valid = verify_totp_code(hex_seed, body.code, valid_window=1)
+    code = payload.code.strip()
 
-        # 5. Return result
-        return {"valid": bool(is_valid)}
+    # Validate code input
+    if len(code) != 6 or not code.isdigit():
+        return {"valid": False}
 
-    except Exception:
-        return JSONResponse(
-            status_code=500,
-            content={"error": "Seed not decrypted yet"}
-        )
+    result = verify_totp_code(hex_seed, code)
+    return {"valid": result}
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}

@@ -1,52 +1,33 @@
 #!/usr/bin/env python3
-# Cron script to log 2FA codes every minute
-
-import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
+import string, base64
+import pyotp
 
-# Make sure we can import totp_utils from /app
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-APP_ROOT = os.path.dirname(SCRIPT_DIR)
-if APP_ROOT not in sys.path:
-    sys.path.insert(0, APP_ROOT)
+SEED_FILE = Path("/data/seed.txt")
 
-from totp_utils import generate_totp_code
-
-DATA_SEED_PATH = "/data/seed.txt"
-
-
-def read_seed():
-    if not os.path.exists(DATA_SEED_PATH):
-        return None
-    try:
-        with open(DATA_SEED_PATH, "r") as f:
-            return f.read().strip()
-    except Exception:
-        return None
-
+def generate_totp_code(hex_seed: str) -> str:
+    if len(hex_seed) != 64 or any(c not in string.hexdigits.lower() for c in hex_seed):
+        raise ValueError("Not valid 64-char hex seed")
+    seed_bytes = bytes.fromhex(hex_seed)
+    base32_seed = base64.b32encode(seed_bytes).decode("utf-8")
+    totp = pyotp.TOTP(base32_seed, digits=6, interval=30)
+    return totp.now()
 
 def main():
-    seed = read_seed()
-    if not seed:
-        print("No seed found")
+    if not SEED_FILE.exists():
+        print("No seed found", file=sys.stderr)
         return
 
-    # Generate TOTP code
     try:
-        code = generate_totp_code(seed)
+        hex_seed = SEED_FILE.read_text().strip().lower()
+        code = generate_totp_code(hex_seed)
+        now = datetime.now(timezone.utc)
+        ts = now.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"{ts} - 2FA Code: {code}")
     except Exception as e:
-        print("Error generating code:", e)
-        return
-
-    # Get current UTC timestamp (no pytz needed)
-    now = datetime.now(timezone.utc)
-    ts = now.strftime("%Y-%m-%d %H:%M:%S")
-
-    # Format: "[timestamp] - 2FA Code: {code}"
-    line = f"[{ts}] - 2FA Code: {code}"
-    print(line)
-
+        print(f"Error: {e}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()
