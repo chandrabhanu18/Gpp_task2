@@ -105,6 +105,7 @@ def decrypt_seed_endpoint(payload: DecryptSeedRequest):
     SEED_FILE.write_text(hex_seed + "\n", encoding="utf-8")
 
     return {"status": "ok"}
+# 
 
 
 @app.get("/generate-2fa")
