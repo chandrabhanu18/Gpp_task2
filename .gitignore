@@ -4,3 +4,5 @@ __pycache__/
 .vscode/
 .idea/
 .env
+data/seed.txt
+cron/last_code.txt
